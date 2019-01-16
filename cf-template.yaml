@@ -1,0 +1,674 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Trilok Knowledge Centre
+
+Parameters:
+  ReadCapacityUnits:
+    Description: Provisioned read throughput
+    Type: Number
+    Default: '5'
+    MinValue: '5'
+    MaxValue: '10000'
+    ConstraintDescription: must be between 5 and 10000
+  WriteCapacityUnits:
+    Description: Provisioned write throughput
+    Type: Number
+    Default: '10'
+    MinValue: '5'
+    MaxValue: '10000'
+    ConstraintDescription: must be between 5 and 10000
+  ElasticTranscoderPipelineLambdaName:
+    Description: ElasticTranscoderPipeline lambda name
+    Type: String
+
+Resources:
+  # Creates a user pool in cognito for your app to auth against
+  # This example requires MFA and validates the phone number to use as MFA
+  # Other fields can be added to the schema
+  UserPool:
+    Type: "AWS::Cognito::UserPool"
+    Properties:
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+      UserPoolName: !Sub ${AWS::StackName}_trilok_user_login
+  # Creates a User Pool Client to be used by the identity pool
+  UserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}_trilok_user_login
+      ExplicitAuthFlows: 
+        - USER_PASSWORD_AUTH
+  
+  # Creates a federeated Identity pool
+  IdentityPool:
+    Type: "AWS::Cognito::IdentityPool"
+    Properties:
+      AllowUnauthenticatedIdentities: false
+      IdentityPoolName: !Sub ${AWS::StackName}_trilok_user_login
+      CognitoIdentityProviders: 
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # Create a role for authorized acces to AWS resources. Control what your user can access. This example only allows Lambda invokation
+  # Only allows users in the previously created Identity Pool
+  CognitoAuthorizedRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Federated: "cognito-identity.amazonaws.com"
+            Action: 
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals: 
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}CognitoAuthorizedPolicy
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:UpdateItem"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                Resource: "*"
+  
+  # Assigns the roles to the Identity Pool
+  IdentityPoolRoleMapping:
+    Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+
+
+  # creates a dynamo db table
+  myDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: webm_filename
+        AttributeType: S
+      TableName: !Sub ${AWS::StackName}-audio-stream
+      KeySchema:
+      - AttributeName: webm_filename
+        KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref 'ReadCapacityUnits'
+        WriteCapacityUnits: !Ref 'WriteCapacityUnits'
+
+  #create a role for the lambda having all permisions which are required
+  DeploymentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - 
+          PolicyName: !Sub ${AWS::StackName}LambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - dynamodb:*
+              - events:*
+              - lambda:*
+              - logs:*
+              - s3:*
+              - cloudwatch:*
+              Resource: "*"
+        -
+          PolicyName: !Sub ${AWS::StackName}elasticTrancode
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - elastictranscoder:*
+              - s3:ListAllMyBuckets
+              - s3:ListBucket
+              - s3:ListObjects
+              - iam:ListRoles
+              - sns:ListTopics
+              Effect: Allow
+              Resource: "*"
+            - Action:
+              - iam:PassRole
+              Effect: Allow
+              Resource: "*"
+              Condition:
+                StringLike:
+                  iam:PassedToService:
+                  - elastictranscoder.amazonaws.com
+        - 
+          PolicyName: !Sub ${AWS::StackName}CreateCognitoUser
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - cognito-idp:*
+              Resource: "*"
+
+
+  # creates a lambda to convert webm to mp4
+  #S3Bucket: trilok_cloud_formation_asset
+  LambdaConvertWebmToMp4:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_convert_webm_to_mp4
+      Code:
+        S3Bucket: bucket_where_your_lambda_code_is_present
+        S3Key:  convert_webm_to_mp4.zip
+      Environment:
+        Variables:
+          PIPELINE_ID: PIPELINEID
+          INPUT_BUCKET: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data
+          TABLE_NAME: !Ref 'myDynamoDBTable'
+      Role: 
+        Fn::GetAtt: 
+          - "DeploymentLambdaRole"
+          - "Arn"
+      Handler: convert_webm_to_mp4.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+
+  #create s3 bucket to store all the webm files, documents, user images
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt 
+        - LambdaConvertWebmToMp4
+        - Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn:
+        Fn::Join:
+          - ""
+          -
+            - 'arn:aws:s3:::'
+            - !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data
+
+  S3BucketToStoreDataFromUser:
+    DependsOn: LambdaInvokePermission
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data
+      AccessControl: PublicRead
+      CorsConfiguration:
+        CorsRules:
+          - 
+            AllowedMethods: [GET,POST,PUT,DELETE,HEAD]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag,x-amz-meta-custom-header]
+      NotificationConfiguration:
+        LambdaConfigurations:
+          -
+            Function: !GetAtt
+              - LambdaConvertWebmToMp4
+              - Arn
+            Event: "s3:ObjectCreated:CompleteMultipartUpload"
+            Filter:
+              S3Key:
+                Rules:
+                  -
+                    Name: prefix
+                    Value: audio-files/
+
+  #create s3 bucket to store all elastic transcoder output files
+  S3BucketToStoreElasticTranscodedMp4File:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data-output
+      AccessControl: PublicRead
+      CorsConfiguration:
+        CorsRules:
+          - 
+            AllowedMethods: [GET,POST,PUT,DELETE,HEAD]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag,x-amz-meta-custom-header]
+
+  # creates a lambda to return transcribe, comprehend status.
+  LambdaReturnRecordingFileSatus:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_return_recording_file_status
+      Code:
+        S3Bucket: bucket_where_your_lambda_code_is_present
+        S3Key: return_recording_file_status.zip
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref 'myDynamoDBTable'
+      Role: 
+        Fn::GetAtt: 
+          - "DeploymentLambdaRole"
+          - "Arn"
+      Handler: return-transcribe-status.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+
+  #create a elastic trancode pipeline role
+  ElasticTranscoderPipelineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: "elastictranscoder.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+          - PolicyName: !Sub ${AWS::StackName}ElasticTranscoderPipelineRolePolicy
+            PolicyDocument: 
+              Version: '2008-10-17'
+              Statement:
+              - Sid: '1'
+                Effect: Allow
+                Action:
+                - s3:Put*
+                - s3:ListBucket
+                - s3:*MultipartUpload*
+                - s3:Get*
+                Resource: "*"
+              - Sid: '2'
+                Effect: Allow
+                Action: sns:Publish
+                Resource: "*"
+              - Sid: '3'
+                Effect: Deny
+                Action:
+                - s3:*Delete*
+                - s3:*Policy*
+                - sns:*Remove*
+                - sns:*Delete*
+                - sns:*Permission*
+                Resource: "*"
+
+  # creates a lambda just for service token
+  LambdaServiceToken:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_elasticTranscodeLambdaServiceToken
+      Code:
+        S3Bucket: bucket_where_your_lambda_code_is_present
+        S3Key:  elastic_transcoder.zip
+      Environment:
+        Variables:
+          ELASTIC_TRANSCODER_NAME: !Sub ${AWS::StackName}-audio-data-to-mp4
+          ELASTIC_TRANSCODER_INPUT_BUCKET: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data
+          ELASTIC_TRANSCODER_OUTPUT_BUCKET: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data-output
+          ELASTIC_TRANSCODER_DISABLE_EVENT: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledRule
+          LAMBDA_WEBM_TO_MP4: !Sub ${AWS::StackName}_convert_webm_to_mp4
+          ELASTIC_TRANSCODER_ROLE_NAME: 
+            Fn::GetAtt: 
+              - "ElasticTranscoderPipelineRole"
+              - "Arn"
+      Role: 
+        Fn::GetAtt: 
+          - "DeploymentLambdaRole"
+          - "Arn"
+      Handler: elastic_transcoder.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+
+  #trigger this in order to create elastic transcoder
+  ScheduledRule: 
+    DependsOn: LambdaServiceToken
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 minute)"
+      Name: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledRule
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "LambdaServiceToken"
+              - "Arn"
+          Id: !Sub ${AWS::StackName}-${AWS::AccountId}-TargetFunction
+  
+  PermissionForEventsToInvokeLambda: 
+    DependsOn: ScheduledRule
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "LambdaServiceToken"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"
+  
+  #bucket to host a website
+  WebHosting:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Join:
+          - ""
+          - 
+            - 'trilok-web'
+            - !Sub ${AWS::StackName}-${AWS::AccountId}
+      AccessControl: 'PublicReadWrite'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+      WebsiteConfiguration:
+        IndexDocument: home.html
+
+  # creates a lambda and move html files to s3
+  LambdaWebhosting:
+    DependsOn: WebHosting
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_webhosting_lambda
+      Code:
+        S3Bucket: bucket_where_your_lambda_code_is_present
+        S3Key:  clone_website.zip
+      Environment:
+        Variables:
+          OLD_BUCKET: bucket_where_your_lambda_code_is_present
+          NEW_BUCKET: 
+            Fn::Join:
+            - ""
+            - 
+              - 'trilok-web'
+              - !Sub ${AWS::StackName}-${AWS::AccountId}
+          PREFIX_REPLACE: 'website-holding/'
+          WEBSITE_DISABLE_EVENT: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledWebsiteRule
+      Role: 
+        Fn::GetAtt: 
+          - "DeploymentLambdaRole"
+          - "Arn"
+      Handler: clone_website.lambda_handler
+      Runtime: python3.7
+      Timeout: 600
+
+  #trigger this in order to update the s3 bucket with website data.
+  ScheduledWebsiteRule: 
+    DependsOn: LambdaWebhosting
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledWebsiteRule"
+      ScheduleExpression: "rate(1 minute)"
+      Name: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledWebsiteRule
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "LambdaWebhosting"
+              - "Arn"
+          Id: !Sub ${AWS::StackName}-${AWS::AccountId}-WebTargetFunction
+
+  PermissionForEventsToInvokeLambdaWebhosting: 
+    DependsOn: ScheduledWebsiteRule
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "LambdaWebhosting"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledWebsiteRule"
+          - "Arn"
+
+  cloudFrontHosting:
+    DependsOn: WebHosting
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        DefaultCacheBehavior:
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+          TargetOriginId: 
+            Fn::Join:
+              - ""
+              - 
+                - 'trilok-web'
+                - !Sub ${AWS::StackName}-${AWS::AccountId}
+          ViewerProtocolPolicy: https-only
+        DefaultRootObject: home.html
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+          - DomainName:
+              Fn::Join:
+                - ""
+                - 
+                  - 'trilok-web'
+                  - !Sub ${AWS::StackName}-${AWS::AccountId}
+                  - .s3.amazonaws.com
+            Id: 
+              Fn::Join:
+                - ""
+                - 
+                  - 'trilok-web'
+                  - !Sub ${AWS::StackName}-${AWS::AccountId}
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join [ "", [ "origin-access-identity/cloudfront/", !Ref TheCloudFrontOriginAccessIdentity ] ]
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  TheCloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment:
+          Fn::Join:
+            - ""
+            - 
+              - 'trilok-web'
+              - !Sub ${AWS::StackName}-${AWS::AccountId}
+
+  WebsiteBucketPolicy: 
+    DependsOn: WebHosting
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref WebHosting
+      PolicyDocument: 
+        Statement: 
+          - 
+            Action: 
+              - "s3:GetObject"
+            Effect: "Allow"
+            Resource: 
+              Fn::Join: 
+                - ""
+                - 
+                  - "arn:aws:s3:::"
+                  - 
+                    !Ref WebHosting
+                  - "/*"
+            Principal: "*"
+
+  # creates a lambda to replace the config values
+  LambdaReplaceConfigValues:
+    DependsOn: cloudFrontHosting
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_replace_config_values_lambda
+      Code:
+        S3Bucket: bucket_where_your_lambda_code_is_present
+        S3Key:  replace_config.zip
+      Environment:
+        Variables:
+          FILE_LIST: 'main.js;login.html;structured.html;unstructured.html;index.html;comprehend-status.html'
+          CONFIG_FILE_REPLACE_BUCKET: !Ref WebHosting
+          REGION: !Sub ${AWS::Region}
+          POOLID: !Ref IdentityPool
+          S3BUCKETNAMEFORFILES: !Ref S3BucketToStoreDataFromUser
+          DYNAMOTABLE: !Ref myDynamoDBTable
+          USERPOOLID: !Ref UserPool
+          CLIENTID: !Ref UserPoolClient
+          ENVUPDATEHTMLFORTRANSCRIBEFUNCTION: !Ref LambdaReturnRecordingFileSatus
+          WEBSITE_DISABLE_EVENT: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledLambdaReplaceConfigValues
+      Role: 
+        Fn::GetAtt: 
+          - "DeploymentLambdaRole"
+          - "Arn"
+      Handler: replace_config.lambda_handler
+      Runtime: python3.7
+      Timeout: 600
+
+  #trigger this in order to replace config values
+  ScheduledLambdaReplaceConfigValues: 
+    DependsOn: LambdaReplaceConfigValues
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledLambdaReplaceConfigValues"
+      ScheduleExpression: "rate(1 minute)"
+      Name: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledLambdaReplaceConfigValues
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "LambdaReplaceConfigValues"
+              - "Arn"
+          Id: !Sub ${AWS::StackName}-${AWS::AccountId}-LRCVTF
+
+  PermissionForEventsToInvokeLambdaReplaceConfigValues: 
+    DependsOn: ScheduledLambdaReplaceConfigValues
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "LambdaReplaceConfigValues"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledLambdaReplaceConfigValues"
+          - "Arn"
+
+  #create admin user in cognito
+  LambdaCognitoUser:
+    DependsOn: LambdaReplaceConfigValues
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_create_cognito_user_lambda
+      Code:
+        S3Bucket: bucket_where_your_lambda_code_is_present
+        S3Key:  create_cognito_user.zip
+      Environment:
+        Variables:
+          USERPOOLID: !Ref UserPool
+          CLIENTID: !Ref UserPoolClient
+          WEBSITE_DISABLE_EVENT: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledLambdaCreateCognitoUser
+      Role: 
+        Fn::GetAtt: 
+          - "DeploymentLambdaRole"
+          - "Arn"
+      Handler: create_cognito_user.lambda_handler
+      Runtime: python3.7
+      Timeout: 600
+
+  #trigger this in order to replace config values
+  ScheduledLambdaCreateCognitoUser: 
+    DependsOn: LambdaCognitoUser
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledLambdaCreateCognitoUser"
+      ScheduleExpression: "rate(1 minute)"
+      Name: !Sub ${AWS::StackName}-${AWS::AccountId}-ScheduledLambdaCreateCognitoUser
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "LambdaCognitoUser"
+              - "Arn"
+          Id: !Sub ${AWS::StackName}-${AWS::AccountId}-CCU
+
+  PermissionForEventsToInvokeLambdaCreateCognitoUser: 
+    DependsOn: ScheduledLambdaCreateCognitoUser
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "LambdaCognitoUser"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledLambdaCreateCognitoUser"
+          - "Arn"
+
+
+  #elasticTrancode pipeline
+  #ElasticTranscoderConvertWebmToMp4:
+  #  DependsOn: LambdaServiceToken
+  #  Type: 'Custom::ElasticTranscoderPipeline'
+  #  Properties: 
+  #    ServiceToken:
+  #      Fn::Join:
+  #      - ":"
+  #      - - arn:aws:lambda
+  #        - !Sub ${AWS::Region}
+  #        - !Sub ${AWS::AccountId}
+  #        - function
+  #        - !Sub ${AWS::StackName}_elasticTranscodeLambdaServiceToken
+  #    Name: !Sub ${AWS::StackName}-audio-data-to-mp4
+  #    InputBucket: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data
+  #    OutputBucket: !Sub ${AWS::StackName}-${AWS::AccountId}-audio-stream-data-output
+  #    Roles: !Ref ElasticTranscoderPipelineRole
+
+
+#Outputs:
+#  UserPoolId:
+#    Value: !Ref UserPool
+#    Export:
+#      Name: "UserPool::Id"
+#  UserPoolClientId:
+#    Value: !Ref UserPoolClient
+#    Export:
+#      Name: "UserPoolClient::Id"
+#  IdentityPoolId:
+#    Value: !Ref IdentityPool
+#    Export:
+#      Name: "IdentityPool::Id"
